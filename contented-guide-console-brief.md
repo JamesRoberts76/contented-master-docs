@@ -1,10 +1,13 @@
-# contented.guide — Console Architecture & Build Brief (v1.0)
+# contented.guide — Console Architecture & Build Brief (v1.1)
 
 **For:** Perplexity, to build autonomously against, then return for review before
 any GitHub/Cloudflare/Stripe production step.
-**Status:** Complete starting instruction. Six issues found in an earlier draft
-of this brief are fixed *in* the design below, not just noted — see §0 for what
-changed and why.
+**Status:** Revised after independent review from Perplexity and Gemini.
+Six new fixes in this revision: a full auth/session lifecycle (§5.1), a fully
+specified encryption approach (§4.3), an atomic Stripe webhook process
+(§5.2), corrected deletion wording that doesn't overpromise (§8), a hardened
+schema with real constraints and an audit table (§4.1), and a required
+failure/recovery matrix (§12).
 **Do not deploy, connect domains, activate Stripe live mode, or run production
 D1 migrations without James's explicit sign-off, per Master §20-21.**
 
@@ -129,31 +132,51 @@ Two honest options:
 
 ## 4. Data architecture (Cloudflare D1)
 
-### 4.1 Required tables
+### 4.1 Required tables (revised — hardened per review)
 
 ```sql
 CREATE TABLE users (
   id TEXT PRIMARY KEY,
-  email TEXT UNIQUE NOT NULL,
-  membership_status TEXT NOT NULL DEFAULT 'free',
-  created_at TEXT NOT NULL
+  email TEXT UNIQUE NOT NULL,          -- normalised (lowercased) before insert
+  membership_status TEXT NOT NULL
+    CHECK (membership_status IN ('free', 'active', 'cancelled', 'past_due'))
+    DEFAULT 'free',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 
+-- Status is now a real lifecycle, not a fire-and-forget log line.
 CREATE TABLE stripe_events (
-  id TEXT PRIMARY KEY,
+  id TEXT PRIMARY KEY,                 -- Stripe's event ID; enforces dedup
   type TEXT NOT NULL,
-  processed_at TEXT NOT NULL
+  status TEXT NOT NULL
+    CHECK (status IN ('received', 'processing', 'processed', 'failed'))
+    DEFAULT 'received',
+  event_created_at TEXT NOT NULL,      -- Stripe's own event timestamp —
+                                        -- used to reject out-of-order updates
+  received_at TEXT NOT NULL,
+  processed_at TEXT
 );
 
--- Corrected: consent is per-item and explicit, never implicit.
 CREATE TABLE reflections (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id),
-  node_source TEXT NOT NULL,
-  pillar_tag TEXT,
-  content TEXT NOT NULL,
+  node_source TEXT NOT NULL
+    CHECK (node_source IN (
+      'compressed.guide','back.guide','legs.guide','recalibration.guide'
+      -- extend this allowlist explicitly as each node goes live; never
+      -- accept an arbitrary client-supplied string here
+    )),
+  pillar_tag TEXT
+    CHECK (pillar_tag IS NULL OR pillar_tag IN
+      ('movement','presence','purpose','safety','input')),
+  content_ciphertext BLOB NOT NULL,    -- see §4.3 — never plaintext
+  content_iv BLOB NOT NULL,
+  content_auth_tag BLOB NOT NULL,
+  key_version INTEGER NOT NULL,
   saved_explicitly BOOLEAN NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 
 CREATE TABLE threads (
@@ -163,8 +186,11 @@ CREATE TABLE threads (
   node_id TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+-- Open question, correctly raised in review: if full chat transcripts are
+-- deliberately never stored by default, confirm whether `threads` needs to
+-- exist at all yet, or only once a real, deliberate "save this thread"
+-- action exists — don't build storage ahead of an actual feature.
 
--- Waitlist only at this stage — see §6. No audio infrastructure implied.
 CREATE TABLE voice_preferences (
   user_id TEXT PRIMARY KEY REFERENCES users(id),
   notify_requested BOOLEAN NOT NULL DEFAULT 0,
@@ -172,25 +198,62 @@ CREATE TABLE voice_preferences (
   frequency TEXT,
   time_preference TEXT
 );
+
+-- New: a dedicated, redaction-aware audit table — not informal logging.
+CREATE TABLE audit_log (
+  id TEXT PRIMARY KEY,
+  user_id TEXT REFERENCES users(id),
+  event_type TEXT NOT NULL,            -- e.g. 'login', 'delete_requested',
+                                        -- 'membership_changed' — never raw
+                                        -- reflection content
+  occurred_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_reflections_user_node ON reflections(user_id, node_source, created_at DESC);
+CREATE INDEX idx_threads_user_node ON threads(user_id, node_id, updated_at DESC);
+CREATE UNIQUE INDEX idx_stripe_event_id ON stripe_events(id);
 ```
 
 ### 4.2 Tenant isolation
 
-Every query touching `reflections` or `threads` must filter by the
-authenticated `user_id` from the verified session token — never from a
+Every query touching `reflections`, `threads`, or `audit_log` must filter by
+the authenticated `user_id` from the verified session token — never from a
 client-supplied value. No table is queryable without that filter present in
 the prepared statement itself, not just enforced by application logic that
-could be bypassed.
+could be bypassed. Use parameterised queries and batched writes for any
+related multi-table state change (Cloudflare D1 supports both through Worker
+bindings) — never string-concatenated SQL.
 
-### 4.3 Encryption at rest (new requirement, was missing)
+### 4.3 Encryption at rest — now fully specified, not deferred
 
-`reflections.content` must be encrypted at rest, not just deleted on
-request. Cloudflare D1 does not provide field-level encryption natively —
-this means application-layer encryption (encrypt before insert, decrypt
-after fetch, using a key held only in Worker environment secrets, never in
-D1 itself). **This needs a concrete implementation decision from Perplexity
-before building** — flag the specific approach chosen back to James for
-review, since this is genuinely security-critical, not a style choice.
+**Algorithm:** AES-256-GCM (authenticated encryption), via WebCrypto inside
+the Worker.
+
+**Key hierarchy:** a single root key held only in Worker environment
+secrets, never in D1. Each encrypted record stores its own `key_version`
+column so a future key rotation doesn't silently break old records — old
+ciphertext stays decryptable under the version it was written with, while
+new writes use the current version.
+
+**Stored alongside ciphertext, per record:** the IV/nonce and the GCM
+authentication tag — both required for decryption and for detecting
+tampering. Never store the encryption key itself anywhere near the
+ciphertext.
+
+**Search/filtering limitation, stated honestly:** encrypted content cannot
+be searched or filtered server-side in the ordinary way. `pillar_tag` and
+`node_source` remain plaintext specifically so filtering/browsing still
+works without ever touching the encrypted content itself.
+
+**Crypto-erasure as part of deletion (§8):** destroying a user's specific
+data-encryption key material (if a per-user key layer is added later) is a
+stronger deletion guarantee than relying on row deletion alone — worth
+building toward, not required for the first version.
+
+**Rotation:** re-encrypting existing records under a new key version happens
+as a deliberate, tracked background operation, never silently or
+automatically — record which `key_version` is current in a small config
+table or Worker binding.
 
 ### 4.4 Consent model, explicit
 
@@ -205,26 +268,68 @@ different, not just be indistinguishable text sitting in the same view.
 
 ## 5. Authentication and Stripe
 
-### 5.1 Auth
+### 5.1 Auth — full lifecycle, not just "ES256 verification"
 
-- ES256 token verification, mapped to `membership_status` in `users`.
-- JWT secrets and API keys live only in Worker environment variables, never
-  in D1, never client-visible.
+This needs to be settled as its own short design decision before UI work
+begins, not left implicit:
 
-### 5.2 Stripe webhook pipeline
+```text
+Issuer:              a dedicated auth Worker (not Stripe, not a third party)
+Required claims:     iss, aud, sub, exp, iat, nbf, jti, membership_status
+Session transport:   short-lived access token (bearer) + rotating refresh
+                      token — not a single long-lived session cookie
+CSRF defence:         required if any cookie authenticates a state-changing
+                      request; not required for pure bearer-token calls
+Revocation:          on logout, email/password change, membership
+                      cancellation, and account deletion — the refresh
+                      token must be invalidated server-side, not just
+                      discarded client-side
+Account lifecycle:   explicit, documented flows for creation, sign-in,
+                      email verification, password/account recovery, and
+                      removal
+```
 
-- Edge-native signature verification via `Stripe.createSubtleCryptoProvider()`.
-- Handler sequence: parse raw request → verify signature → insert event ID
-  into `stripe_events` (deduplication) → queue entitlement update → return
-  `200 OK` immediately.
-- Entitlement checked against `membership_status` before any member route or
-  API payload is served.
+**This is a required deliverable in its own right** — Perplexity should
+return this as a short, explicit design note before building the UI against
+it, not decide it implicitly inside the implementation.
+
+### 5.2 Stripe webhook pipeline — corrected to an atomic, status-based
+process
+
+The original linear sequence risked marking an event "processed" before its
+entitlement update had actually succeeded, with no handling for duplicate or
+out-of-order delivery. Corrected process:
+
+```text
+1. Retain the raw request body untouched until signature verification
+   succeeds (Stripe signs against the exact raw body).
+2. Verify the Stripe-Signature header against that raw body and the
+   webhook secret.
+3. Validate the event schema.
+4. Insert the event into stripe_events with status = 'received' if its ID
+   doesn't already exist (idempotency — a retried delivery is a no-op here).
+5. Compare the event's own timestamp against the user's current
+   membership state — reject applying an older event over a newer one
+   (out-of-order protection).
+6. Update status to 'processing', apply the entitlement change, then
+   update status to 'processed' — or 'failed' if the update didn't
+   succeed, so a retry/reconciliation pass can find it later.
+7. Return 200 OK to Stripe only once the event is durably recorded,
+   regardless of whether entitlement processing has fully finished —
+   Stripe needs the acknowledgement promptly; the status field is what
+   tracks real completion.
+```
+
+A separate, simple reconciliation check (even a manual one initially) for
+any event stuck in `processing` or `failed` beyond a reasonable window is
+part of this deliverable, not an afterthought.
 
 ### 5.3 Pricing — PROPOSED, NOT DECIDED
 
 The original brief stated €50/year as settled fact. **It is not decided.**
-Perplexity should build the Stripe integration to accept a configurable
-price point, not hardcode any figure, until James explicitly approves one.
+The Stripe integration must read the price ID from a Worker environment
+variable, never hardcoded, so the actual figure can be set and changed
+without a code change, until James explicitly approves a number.
 
 ---
 
@@ -275,12 +380,81 @@ system:
 
 ---
 
-## 8. Absolute deletion protocol
+## 8. Deletion protocol — corrected wording, same real intent
 
-- `DELETE /api/user/delete` — cascading hard delete across every table for
-  the authenticated `user_id`. No soft delete, no retention window, no
-  hidden backup copy.
-- This remains genuinely correct and unchanged from the original brief.
+**The original "no hidden backup copy" wording is withdrawn — it's an
+absolute promise that can't actually be verified** without documented,
+tested control over Cloudflare's own backup/recovery systems, deployment
+snapshots, and Stripe's own retention requirements. Promising it anyway
+would be exactly the kind of overclaim this network has already corrected
+elsewhere (never "absolute confidentiality").
+
+**Public-facing wording (use this instead):**
+
+> "We delete your active account and saved-reflection records from our
+> operational database when you request deletion. Limited records may
+> remain in secure backups, or be retained where necessary for legal,
+> fraud-prevention, payment, or security purposes, and are never used to
+> restore ordinary account access."
+
+**Internal requirements, defined explicitly:**
+
+```text
+- DELETE /api/user/delete — cascading hard delete across every operational
+  table for the authenticated user_id, executed immediately.
+- A documented backup retention window (whatever Cloudflare's actual
+  defaults are — confirm and state the real number, don't guess).
+- A restore procedure that re-applies deletion if a backup is ever
+  restored (a deletion ledger/tombstone approach, not just hoping it's
+  remembered).
+- Stripe/payment records that cannot be deleted by this system at all —
+  named explicitly, not glossed over.
+- Audit-log entries retained for a limited, stated period for
+  security/fraud purposes, separate from the user's own content.
+```
+
+---
+
+## 12. Failure and recovery matrix — required deliverable, not optional
+
+For each state below, define: exact user-facing wording, API status
+returned, retry behaviour, data-integrity guarantee, and whether the
+console fails closed, goes read-only, or shows a maintenance state.
+
+```text
+- D1 unavailable / read timeout / write failure
+- Stripe webhook delayed, duplicated, out-of-order, invalid, or unavailable
+- Auth key/JWK unavailable
+- Expired or revoked token
+- Session expiry mid-save
+- AI provider unavailable
+- Browser offline during save
+- Cross-origin/CORS failure
+- Client/server API version mismatch
+- Deployment failure/rollback
+- Full contented.guide outage
+```
+
+This can start as a simple table Perplexity fills in alongside the build —
+it doesn't need to be exhaustive on day one, but it needs to exist before
+real member data is at stake.
+
+---
+
+## Appendix A — Voice guardrails, preserved for Phase 1b
+
+Not active in this build (§6), but documented now so they're ready
+unchanged whenever the real voice engine is actually built:
+
+```text
+- One-question rule: never ask more than one thing per spoken turn.
+- 30-50 words maximum per spoken turn.
+- Single, calm, neutral British delivery — no multi-accent support.
+- Zero empathy clichés or conversational padding.
+- Prompt reflection, never preach or instruct.
+- Prominent one-click kill switch, disabling voice permanently.
+- Zero automated guilt-trip follow-ups if a check-in is missed.
+```
 
 ---
 
@@ -312,15 +486,29 @@ draft's "five nodes" claim did.
 
 ## 11. What needs James's explicit decision before Perplexity builds further
 
+**Resolved by this revision, confirm with a quick yes:**
+
 ```text
-1. "Get Apps and extensions" menu item — repurpose as "Your Network" (§3.2),
-   or remove until a real feature exists.
-2. Annual membership price — currently proposed at €50, not approved.
-3. The specific encryption-at-rest implementation approach (§4.3) — needs a
-   concrete proposal from Perplexity, then James's sign-off, before real
-   reflection content touches the database.
-4. Whether the safety mechanism's second-pass model layer (§7.2) is built
-   now or deferred alongside voice — it adds real complexity and may be
-   worth deferring on the same "solo operator, keep it simple" grounds as
-   voice itself.
+1. "Get Apps and extensions" → "Your Network" (§3.2) — both reviewers
+   independently converged on this; showing only nodes a member has
+   actually engaged with, never inferred interest.
+2. Encryption approach (§4.3) — AES-256-GCM via WebCrypto in the Worker,
+   with key versioning. This is now a specific proposal, not an open
+   question — confirm you're comfortable with it rather than deciding
+   the primitive yourself.
 ```
+
+**Still genuinely open:**
+
+```text
+3. Annual membership price — proposed at €50, not approved; the build
+   reads it from environment config either way, so this doesn't block
+   starting.
+4. Whether the safety mechanism's second-pass model layer (§7.2) is
+   built now or deferred — still worth deciding on the same
+   "solo operator, keep it simple" grounds as voice itself.
+5. Whether `threads` needs to exist as a table yet at all, given full
+   transcripts aren't stored by default (flagged in §4.1) — a real,
+   fair question raised in review, not yet answered.
+```
+
